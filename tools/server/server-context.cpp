@@ -671,9 +671,7 @@ struct server_slot {
         return res;
     }
 
-    void copy_state_to(server_slot & other) const {
-        GGML_ASSERT(state == SLOT_STATE_DONE_PROMPT);
-
+    void copy_prompt_state_to(server_slot & other, bool copy_checkpoints) const {
         common_context_seq_rm(ctx_tgt, other.id,     -1, -1);
         common_context_seq_cp(ctx_tgt, id, other.id, -1, -1);
 
@@ -681,6 +679,22 @@ struct server_slot {
             common_context_seq_rm(ctx_dft, other.id,     -1, -1);
             common_context_seq_cp(ctx_dft, id, other.id, -1, -1);
         }
+
+        server_prompt prompt_copy;
+        prompt_copy.tokens = prompt.tokens.clone();
+        if (copy_checkpoints) {
+            prompt_copy.checkpoints = prompt.checkpoints;
+        }
+
+        other.prompt = std::move(prompt_copy);
+        other.lora = lora;
+        other.alora_invocation_start = alora_invocation_start;
+    }
+
+    void copy_state_to(server_slot & other) const {
+        GGML_ASSERT(state == SLOT_STATE_DONE_PROMPT);
+
+        copy_prompt_state_to(other, true);
 
         other.n_decoded   = n_decoded;
         other.n_remaining = n_remaining;
@@ -691,7 +705,6 @@ struct server_slot {
         other.n_prompt_tokens_cache     = n_prompt_tokens_cache;
         other.n_prompt_tokens_processed = n_prompt_tokens_processed;
 
-        other.prompt = prompt.clone();
         other.init_sampler();
     }
 
@@ -2603,6 +2616,43 @@ private:
                     res->n_erased = n_erased;
                     queue_results.send(std::move(res));
                 } break;
+            case SERVER_TASK_TYPE_SLOT_COPY:
+                {
+                    if (!check_no_mtmd(task.id)) {
+                        break;
+                    }
+
+                    const int id_src = task.slot_action.id_src;
+                    const int id_dst = task.slot_action.id_dst;
+
+                    if (id_src < 0 || id_src >= (int) slots.size() ||
+                        id_dst < 0 || id_dst >= (int) slots.size()) {
+                        send_error(task, "Invalid slot ID", ERROR_TYPE_INVALID_REQUEST);
+                        break;
+                    }
+                    if (id_src == id_dst) {
+                        send_error(task, "Source and destination slot IDs must differ", ERROR_TYPE_INVALID_REQUEST);
+                        break;
+                    }
+
+                    server_slot & slot_src = slots[id_src];
+                    server_slot & slot_dst = slots[id_dst];
+
+                    if (slot_src.is_processing() || slot_dst.is_processing()) {
+                        send_error(task, "Source or destination slot is processing", ERROR_TYPE_UNAVAILABLE);
+                        break;
+                    }
+
+                    const size_t n_tokens = slot_src.prompt.tokens.size();
+                    slot_src.copy_prompt_state_to(slot_dst, false);
+
+                    auto res = std::make_unique<server_task_result_slot_copy>();
+                    res->id       = task.id;
+                    res->id_src   = id_src;
+                    res->id_dst   = id_dst;
+                    res->n_tokens = n_tokens;
+                    queue_results.send(std::move(res));
+                } break;
             case SERVER_TASK_TYPE_GET_LORA:
                 {
                     // TODO @ngxson : make lora_adapters a dedicated member of server_context
@@ -4473,12 +4523,44 @@ void server_routes::init_routes() {
 
     this->post_slots = [this](const server_http_req & req) {
         auto res = create_response();
+        std::string id_slot_str = req.get_param("id_slot");
+        std::string action = req.get_param("action");
+
+        if (action == "copy") {
+            if (!params.endpoint_slots) {
+                res->error(format_error_response("This server does not support slots endpoint. Start it with `--slots`", ERROR_TYPE_NOT_SUPPORTED));
+                return res;
+            }
+
+            auto parse_slot_id = [](const std::string & id_str, int & id_slot) {
+                try {
+                    size_t pos = 0;
+                    id_slot = std::stoi(id_str, &pos);
+                    return pos == id_str.size();
+                } catch (const std::exception &) {
+                    return false;
+                }
+            };
+
+            int id_src;
+            if (!parse_slot_id(id_slot_str, id_src)) {
+                res->error(format_error_response("Invalid source slot ID", ERROR_TYPE_INVALID_REQUEST));
+                return res;
+            }
+
+            int id_dst;
+            if (!parse_slot_id(req.get_param("id_dst"), id_dst)) {
+                res->error(format_error_response("Invalid destination slot ID", ERROR_TYPE_INVALID_REQUEST));
+                return res;
+            }
+
+            return handle_slots_copy(req, id_src, id_dst);
+        }
+
         if (params.slot_save_path.empty()) {
             res->error(format_error_response("This server does not support slots action. Start it with `--slot-save-path`", ERROR_TYPE_NOT_SUPPORTED));
             return res;
         }
-
-        std::string id_slot_str = req.get_param("id_slot");
 
         int id_slot;
         try {
@@ -4487,8 +4569,6 @@ void server_routes::init_routes() {
             res->error(format_error_response("Invalid slot ID", ERROR_TYPE_INVALID_REQUEST));
             return res;
         }
-
-        std::string action = req.get_param("action");
 
         if (action == "save") {
             return handle_slots_save(req, id_slot);
@@ -5176,6 +5256,34 @@ std::unique_ptr<server_res_generator> server_routes::handle_slots_erase(const se
     }
 
     GGML_ASSERT(dynamic_cast<server_task_result_slot_erase*>(result.get()) != nullptr);
+    res->ok(result->to_json());
+    return res;
+}
+
+std::unique_ptr<server_res_generator> server_routes::handle_slots_copy(const server_http_req & req, int id_src, int id_dst) {
+    auto res = create_response();
+    auto & rd = res->rd;
+    {
+        server_task task(SERVER_TASK_TYPE_SLOT_COPY);
+        task.id = rd.get_new_id();
+        task.slot_action.id_src = id_src;
+        task.slot_action.id_dst = id_dst;
+        rd.post_task(std::move(task));
+    }
+
+    auto result = rd.next(req.should_stop);
+    if (!result) {
+        // connection was closed
+        GGML_ASSERT(req.should_stop());
+        return res;
+    }
+
+    if (result->is_error()) {
+        res->error(result->to_json());
+        return res;
+    }
+
+    GGML_ASSERT(dynamic_cast<server_task_result_slot_copy*>(result.get()) != nullptr);
     res->ok(result->to_json());
     return res;
 }

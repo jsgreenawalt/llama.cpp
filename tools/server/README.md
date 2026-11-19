@@ -1119,6 +1119,20 @@ In *router mode* the query param `?model={model_id}` has to be set. This endpoin
 }
 ```
 
+### POST `/slots/{id_src}?action=copy&id_dst={id_dst}`: Copy an evaluated slot into another slot.
+
+This is an in-memory operation and does not require `--slot-save-path`. Both slots must be idle, and source and destination IDs must be distinct.
+
+**Response format**
+
+```json
+{
+    "id_src": 0,
+    "id_dst": 1,
+    "n_tokens": 1745
+}
+```
+
 ### GET `/lora-adapters`: Get list of all LoRA adapters
 
 This endpoint returns the loaded LoRA adapters. You can add adapters using `--lora` when starting the server, for example: `--lora my_adapter_1.gguf --lora my_adapter_2.gguf ...`

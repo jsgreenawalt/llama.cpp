@@ -1598,6 +1598,17 @@ json server_task_result_slot_erase::to_json() {
 }
 
 //
+// server_task_result_slot_copy
+//
+json server_task_result_slot_copy::to_json() {
+    return json {
+        { "id_src",   id_src },
+        { "id_dst",   id_dst },
+        { "n_tokens", n_tokens },
+    };
+}
+
+//
 // server_task_result_get_lora
 //
 
